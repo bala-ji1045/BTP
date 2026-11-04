@@ -1,0 +1,33 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated training outputs
+artifacts/
+logs/
+*.joblib
+
+# Optional local test suite
+tests/
+
+# Local datasets and large archives
+data/
+*.tar
+*.tar.gz
+*.tgz
+
+# Local tabular exports
+*.csv
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+*.swo

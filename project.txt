@@ -1,0 +1,829 @@
+
+
+PURPOSE Build a complete, reproducible Python machine-learning pipeline
+that predicts photovoltaic (PV) power output in kilowatts from
+timestamped sky/cloud images and timestamp-derived features. Use the
+supplied project PowerPoint as the source of truth for the documented
+design. Inspect the actual dataset files before making assumptions. Do
+not fabricate data, metrics, filenames, image dimensions, or model
+results.
+
+IMPORTANT SOURCE-OF-TRUTH RULE The PowerPoint documents the high-level
+architecture and selected model, but it does NOT specify every low-level
+implementation detail. Preserve the documented facts exactly. Where an
+implementation choice is necessary but not specified, make it
+configurable, document it as an implementation decision, and record it
+in the project README/config. Never present an implementation default as
+something explicitly specified by the PowerPoint.
+
+============================================================ 1. PROJECT
+OBJECTIVE ============================================================
+
+Build a supervised regression system to estimate PV power output (kW)
+from: 1. Timestamped sky/cloud images stored inside TAR archives. 2. PV
+generation measurements stored in CSV format. 3. Time-derived cyclical
+features.
+
+Documented source data: - Image archives: files matching the general
+pattern 2019_*.tar - Image formats: .jpg, .jpeg, .png - Timestamp in
+image filename: 14-digit string in YYYYMMDDHHMMSS format - Filename
+timestamp extraction regex: () - PV CSV filename: 2019_pv_raw.csv - CSV
+timestamp column: Date - Regression target column: Huang_E4102_kW -
+Target unit: kilowatts (kW)
+
+The task is regression, not classification. The model output must be a
+continuous numeric PV power estimate in kW.
+
+The presentation calls the project PV power prediction/forecasting.
+However, the documented matching method aligns an image and PV
+measurement from the same minute. Therefore, implement same-minute PV
+estimation/prediction as the baseline. Do NOT claim future forecasting
+(for example, 15-minute-ahead prediction) unless a future-shifted target
+is explicitly configured and separately evaluated.
+
+============================================================ 2. REQUIRED
+END-TO-END ARCHITECTURE
+============================================================
+
+Implement this pipeline:
+
+A. Discover and validate input files. B. Load and validate the PV CSV.
+C. Stream image members from TAR archives without extracting entire
+archives to disk. D. Extract the 14-digit timestamp from each image
+filename. E. Parse timestamps into datetime values. F. Align image
+timestamps and CSV timestamps at minute precision. G. Enforce one sample
+per minute and apply a documented duplicate policy. H. Decode each image
+and extract deterministic image features. I. Extract cyclical time
+features. J. Concatenate image and time features into a fixed-length
+NumPy float32 vector. K. Build a feature matrix X and target vector y.
+L. Sort samples chronologically and split 70% train, 15% validation, 15%
+test WITHOUT shuffling. M. Train
+sklearn.ensemble.HistGradientBoostingRegressor with the documented
+hyperparameters. N. Evaluate train, validation, and test sets using MAE,
+RMSE, and R-squared. O. Save the trained model, metrics, matched sample
+metadata/features, feature schema, and run configuration. P. Provide a
+reproducible inference interface that applies exactly the same feature
+extraction and feature ordering as training.
+
+High-level data flow: TAR image archives + PV CSV -> timestamp
+extraction and validation -> minute-level matching -> image feature
+extraction + time feature extraction -> fixed-length feature vectors ->
+chronological dataset split -> HistGradientBoostingRegressor -> MAE /
+RMSE / R2 evaluation -> Joblib model + JSON metrics + CSV dataset
+artifacts
+
+============================================================ 3. INPUT
+DATA DISCOVERY AND VALIDATION
+============================================================
+
+The program must accept configurable input paths rather than hard-code a
+single machine’s directory.
+
+Suggested CLI options: –images-dir PATH –csv PATH –output-dir PATH
+–max-samples INTEGER (optional smoke-test limit) –config PATH (optional
+configuration file) –log-level LEVEL
+
+Before processing: - Confirm the CSV exists and is readable. - Confirm
+the configured image directory exists. - Find TAR archives matching
+2019_*.tar or a configurable pattern. - Print/log number of archives and
+CSV rows. - Validate that Date and Huang_E4102_kW columns exist. - Parse
+Date using pandas.to_datetime with errors handled explicitly. - Convert
+target column to numeric using errors=‘coerce’; count and report
+invalid/null target rows. - Do not silently replace missing targets with
+zero. - Decide and document whether invalid target rows are dropped.
+Recommended baseline: drop rows with invalid timestamp or target and
+record counts. - Check target values for non-finite values. - Preserve
+timestamps as datetimes internally. - Log date range, target range, row
+count, missing-value count, and duplicate timestamp count. - Do not
+assume time zone unless the data explicitly documents one. Keep
+timestamps consistently naive or consistently timezone-aware; never mix
+them.
+
+CSV time matching: - Use the Date column as the PV timestamp. - Floor
+timestamps to minute precision. - The documented match condition is:
+image_time.floor(“min”) == csv_time.floor(“min”) - If CSV has multiple
+records in the same minute, apply a deterministic, documented policy. Do
+not silently choose arbitrary rows. The default policy may be
+configurable as first, last, mean, or error. Prefer error or an explicit
+aggregation policy unless dataset inspection shows duplicates do not
+occur. - If image timestamps have multiple images in one minute, the
+PowerPoint says one sample per minute and duplicates are removed, but
+does not specify which duplicate is retained. Implement a configurable
+policy and document it. Recommended deterministic baseline: sort by
+archive path/member name and keep the first image per minute, while
+logging how many duplicates were discarded. If image aggregation is more
+appropriate, make it an optional separate strategy, not the default. -
+Do not join only by row order. Join on normalized minute timestamps. -
+Ensure the final matched records are sorted chronologically. - Report
+unmatched images, unmatched PV rows, duplicate images, duplicate PV
+timestamps, and final matched sample count.
+
+Filename timestamp extraction: - Regex exactly as documented: r”()” -
+Search the image member filename/path for the first match. - Parse with
+datetime.strptime(timestamp_string, “%Y%m%d%H%M%S”). - If no timestamp
+is found or parsing fails, log and skip the member; do not crash the
+whole archive pipeline. - Test timestamp parsing with valid and invalid
+filenames.
+
+============================================================ 4.
+LARGE-SCALE TAR STREAMING AND MEMORY MANAGEMENT
+============================================================
+
+Use Python’s tarfile module to process TAR archives sequentially. - Do
+NOT extract all TAR contents to disk. - Do NOT load all original images
+into RAM. - Iterate through archives and members sequentially. - Process
+one image at a time. - Use tarfile.open in a suitable streaming/read
+mode. Choose the mode based on archive compatibility; support ordinary
+uncompressed TAR and compressed TAR variants only if actual data
+requires them. - Use extractfile(member) to obtain a file-like object
+for an image member. - Decode image bytes in memory, compute features,
+then release image objects and buffers before continuing. - Skip
+directories and non-image members. - Filter supported extensions
+case-insensitively: .jpg, .jpeg, .png. - Catch and log archive errors,
+corrupt member errors, image decode errors, and unexpected per-image
+exceptions. A single bad image must not terminate processing of all
+remaining archives. - Do not hide fatal configuration or data errors.
+Log recoverable per-file errors and continue; fail clearly for missing
+required input files/columns. - Add progress tracking using tqdm. -
+Implement –max-samples for a small test run. Clarify whether this counts
+candidate images or successfully matched/processed samples; make
+behavior consistent and document it. - Avoid accumulating full image
+arrays. Store only compact feature rows and metadata. - For very large
+datasets, write feature rows incrementally to disk in chunks (for
+example, CSV/Parquet/NumPy chunks) rather than keeping all rows in
+memory. The PowerPoint specifically names matched_samples.csv as an
+output; provide that output, but use a scalable intermediate/chunking
+strategy if necessary. - Consider an optional checkpoint/resume
+mechanism for long runs. If implemented, make it deterministic and
+validate checkpoint compatibility with config/schema. - Log elapsed
+time, images processed, images skipped, errors, and throughput.
+
+============================================================ 5. IMAGE
+FEATURE ENGINEERING
+============================================================
+
+The PowerPoint requires these feature groups: 1. RGB color statistics.
+2. Grayscale brightness, contrast, and percentiles. 3. Texture features
+using horizontal and vertical gradient magnitudes. 4. Color difference
+channels: R-B, R-G, G-B. 5. Histograms: 8 bins each for R, G, B, and
+grayscale.
+
+The goal is to represent sky/cloud appearance numerically, capturing
+brightness, color distribution, cloud density proxies, and texture
+patterns.
+
+IMPORTANT: The PowerPoint does not specify image dimensions/resizing,
+exact grayscale percentile list, exact gradient operator, exact gradient
+summary statistics, exact summary statistics for color-difference
+channels, or histogram normalization. These must be explicit
+configurable implementation choices. Do not claim they were specified by
+the slides.
+
+5.1 Image decoding and channel handling - Use a reliable image library
+such as Pillow (PIL) and NumPy unless the repository already uses
+another suitable library. - Convert images to RGB consistently. Handle
+grayscale, palette, RGBA, and other image modes explicitly. - If alpha
+is present, convert consistently to RGB; document the behavior. - Check
+image dimensions and reject zero-sized/corrupt images. - Do not crop
+away sky regions unless the dataset documentation defines a crop. - Do
+not resize by default unless memory/performance or variable dimensions
+require it. If resizing is needed, make target size and interpolation
+configurable and record them in metadata/config. - All feature
+extraction must be deterministic.
+
+5.2 RGB color statistics For each R, G, B channel, compute: - Mean -
+Standard deviation - Minimum - Maximum
+
+For a channel C with N pixels: mean(C) = sum(C_i) / N std(C) =
+sqrt(sum((C_i - mean(C))^2) / N) min(C) = minimum pixel value max(C) =
+maximum pixel value
+
+This yields 3 channels x 4 statistics = 12 explicitly countable
+features.
+
+Choose and document whether pixel values remain in [0,255] or are
+normalized to [0,1]. Keep the same convention for training and
+inference. Prefer a consistent [0,255] convention for direct image
+statistics unless there is a strong reason otherwise.
+
+5.3 Grayscale features Convert RGB to grayscale using a documented
+standard luminance conversion. A common formula is: Gray = 0.299R +
+0.587G + 0.114*B
+
+Extract: - Brightness (define as grayscale mean unless project code
+specifies another definition). - Contrast (define as grayscale standard
+deviation unless project code specifies another definition). -
+Percentiles (the PPT requires percentiles but does not name which
+percentiles).
+
+Make percentile list configurable. A reasonable implementation default
+is [10, 25, 50, 75, 90], but label this as an implementation default,
+not a fact from the PowerPoint. Persist the exact percentile list in
+feature_schema.json and run metadata.
+
+5.4 Texture features using gradients The PowerPoint specifies horizontal
+and vertical gradient magnitudes, but not the operator or aggregation.
+Implement a documented, configurable method: - Compute horizontal
+intensity differences/gradient Gx. - Compute vertical intensity
+differences/gradient Gy. - Compute magnitude = sqrt(Gx^2 + Gy^2), where
+spatial dimensions permit. - Extract deterministic summary statistics
+from |Gx| and |Gy| or gradient magnitude. Recommended baseline: mean and
+standard deviation of absolute horizontal and vertical gradients, plus
+mean gradient magnitude. Make this set explicit in the feature schema. -
+A Sobel operator is an optional alternative if OpenCV/scikit-image is
+already used; do not add a heavy dependency without need. - Ensure edge
+array shapes are handled correctly (for example, np.diff reduces one
+dimension). - Document gradient scaling and boundary handling.
+
+5.5 Color difference features Create per-pixel difference maps: D_RB =
+R - B D_RG = R - G D_GB = G - B
+
+The PPT names these channel deltas but does not define summary
+statistics. Convert each difference map into a fixed set of summary
+statistics. Recommended baseline: mean, standard deviation, minimum,
+maximum for each difference map. This yields 3 x 4 = 12
+implementation-defined features. - Preserve signed differences. -
+Document dtype to avoid unsigned integer wraparound. Convert channels to
+a signed or floating-point type before subtraction. - Keep the exact
+feature names and order stable.
+
+5.6 Histograms Create 8-bin histograms for: - Red channel - Green
+channel - Blue channel - Grayscale channel
+
+Total explicitly specified histogram dimensions: 4 x 8 = 32 features. -
+Use fixed bin edges covering the full supported pixel range. - Normalize
+histograms to proportions (sum to 1) by default so image size does not
+change histogram scale. This normalization is an implementation choice
+and must be documented. - Use identical bin edges and normalization for
+every image. - Give each feature a stable name, e.g. hist_r_00 through
+hist_r_07, hist_g_00… hist_gray_07. - Test that each normalized
+histogram sums approximately to 1 for valid images.
+
+5.7 Feature naming and order - Build one canonical ordered feature-name
+list. - Do not rely on dictionary iteration order from unrelated
+sources. - Every sample must have the same number of features in the
+same order. - Validate no NaN or infinite values occur in feature
+vectors. - If feature extraction fails for an image, skip that sample
+and record the reason. - Save feature schema to feature_schema.json,
+including feature names, data types, formulas, percentile choices,
+histogram bin edges, gradient method, image resize policy, and library
+versions.
+
+Feature count: - The PPT allows calculation of 12 RGB statistics + 32
+histogram features + 6 time features = at least 50 explicitly countable
+features. - The total feature count is NOT specified because the exact
+number of grayscale percentiles, gradient summaries, and
+color-difference summaries is not specified. - The implementation must
+calculate and report its actual feature count after the schema is
+finalized. Do not state that 50 is the complete feature count.
+
+============================================================ 6.
+TIME-BASED FEATURE ENGINEERING
+============================================================
+
+The PowerPoint requires six cyclical time features: - Hour sin and cos
+using a 24-hour cycle. - Day-of-year sin and cos using a 365-day
+cycle. - Month sin and cos using a 12-month cycle.
+
+Use these formulas:
+
+hour_sin = sin(2pih / 24) hour_cos = cos(2pih / 24)
+
+day_sin = sin(2pid / 365) day_cos = cos(2pid / 365)
+
+month_sin = sin(2pim / 12) month_cos = cos(2pim / 12)
+
+Where: - h is hour of day (0 to 23). - d is day of year (1 to 365 for
+the 2019 dataset). - m is month (1 to 12).
+
+Use timestamp values consistently. The PowerPoint does not state whether
+minute/second fractions are included in h; the baseline should use the
+parsed timestamp’s hour component, unless actual source implementation
+says otherwise. 2019 is not a leap year, so the 365-day cycle matches
+this dataset. If generalizing to other years, decide and document
+leap-year handling rather than silently changing the formula. The month
+formula uses m as the 1-based month number as shown by the presentation;
+preserve that convention. These six features should be named
+consistently: hour_sin, hour_cos, day_sin, day_cos, month_sin,
+month_cos. Test values at cycle boundaries and confirm periodic
+behavior.
+
+============================================================ 7. FEATURE
+MATRIX, TARGET, AND DATASET BUILD
+============================================================
+
+For each matched sample: - X row = ordered image features concatenated
+with six time features. - y value = numeric Huang_E4102_kW from the
+matched CSV minute. - Preserve timestamp and source image/archive/member
+path as metadata, not as model input unless explicitly added as a
+feature. - Target remains in kW. Do not normalize target unless a
+separate, reversible target-transform strategy is justified and
+documented. - Convert X to NumPy float32 as required by the PPT. -
+Convert y to a suitable numeric NumPy type, normally float64 or float32,
+and document it. - Ensure X is two-dimensional: (n_samples,
+n_features). - Ensure y is one-dimensional: (n_samples,). - Assert
+X.shape[0] == y.shape[0]. - Assert X.shape[1] equals feature_schema
+feature count. - Check and report NaN/Inf values. - Preserve stable
+sample IDs and chronological timestamps. - Save matched_samples.csv with
+timestamp, image reference/path/member, target, and feature columns. If
+the dataset is too large for a single in-memory DataFrame, write rows
+incrementally/chunkwise.
+
+The PPT names matched_samples.csv as an output artifact. Include it in
+the output directory.
+
+============================================================ 8.
+CHRONOLOGICAL DATASET SPLIT
+============================================================
+
+Use the split specified by the PowerPoint: - 70% training - 15%
+validation - 15% testing - Chronological order - No shuffle
+
+Procedure: 1. Sort all valid matched samples by normalized timestamp
+ascending. 2. Determine split boundaries deterministically. 3. First 70%
+-> train. 4. Next 15% -> validation. 5. Final 15% -> test. 6. Do not
+call train_test_split with shuffle=True. 7. If using sklearn
+train_test_split, explicitly use shuffle=False only if the sequential
+split semantics are preserved. A direct index split is clearer. 8. Save
+split boundaries and timestamp ranges in run metadata. 9. Report sample
+counts and time ranges for each split. 10. Do not fit any learned
+preprocessing operation on validation/test data. The described features
+are deterministic per-image calculations, so they can be extracted
+independently. If any scaler/encoder/selection is added later, fit it on
+training data only. 11. Keep all rows from the same minute in only one
+split; duplicate handling must happen before splitting.
+
+Potential time-series concern: A chronological split evaluates on later
+portions of the same dataset, but it does not automatically guarantee
+robustness across years or sites. Report this limitation.
+
+============================================================ 9.
+MACHINE-LEARNING MODEL
+============================================================
+
+Use: sklearn.ensemble.HistGradientBoostingRegressor
+
+Documented hyperparameters (must be the baseline defaults for this
+project): - learning_rate = 0.05 - max_depth = 6 - max_iter = 300 -
+min_samples_leaf = 20
+
+Example: from sklearn.ensemble import HistGradientBoostingRegressor
+
+model = HistGradientBoostingRegressor( learning_rate=0.05, max_depth=6,
+max_iter=300, min_samples_leaf=20, random_state=42 )
+
+NOTE: random_state=42 is a reproducibility implementation addition; the
+PowerPoint does not specify it. If used, document it. Do not silently
+add other hyperparameters. Keep all unspecified estimator settings at
+the installed scikit-learn defaults unless deliberately configured and
+documented.
+
+Model type: - Supervised learning - Regression - Ensemble learning -
+Gradient boosting - Decision-tree-based - Histogram-based binning of
+numerical features
+
+Conceptual training behavior: 1. The model begins with an initial
+prediction. 2. It computes residual/error information according to its
+loss. 3. It fits successive decision trees to improve the ensemble. 4.
+Each tree contributes according to the learning rate. 5. It repeats up
+to max_iter or any configured early-stopping condition.
+
+The PPT’s explanation is that histogram binning reduces split-search
+work and memory overhead compared with considering every distinct
+feature value. Avoid presenting the simplified complexity O(n_samples x
+n_bins) as a complete runtime complexity for the entire algorithm.
+
+Important model considerations: - HistGradientBoostingRegressor does not
+require standard feature scaling for this tree-based setup. - It handles
+nonlinear relationships and feature interactions. - It is suitable for
+engineered tabular features. - It trains on CPU; no GPU is required. -
+It is not a CNN and does not learn directly from raw pixels. - Do not
+claim built-in regularization details beyond what is supported by the
+estimator and configured settings. - Log installed scikit-learn version
+and complete effective estimator parameters. - Save the model with
+joblib.
+
+Training: model.fit(X_train, y_train)
+
+Generate predictions for: - X_train - X_val - X_test
+
+Do not evaluate only on training data. Do not tune hyperparameters
+against the test set. If validation-based tuning is added, document it
+and leave the test set untouched until final evaluation. If early
+stopping is enabled by library defaults, report the effective behavior
+and parameters.
+
+============================================================ 10.
+EVALUATION METRICS
+============================================================
+
+Calculate all three metrics separately for train, validation, and test:
+
+A. Mean Absolute Error: MAE = mean(abs(y_true - y_pred)) Unit: kW.
+Interpretation: average absolute prediction error.
+
+B. Root Mean Squared Error: RMSE = sqrt(mean((y_true - y_pred)^2)) Unit:
+kW. Interpretation: penalizes larger errors more strongly.
+
+C. R-squared: R2 = 1 - sum((y_true - y_pred)^2) / sum((y_true -
+mean(y_true))^2) Interpretation: fraction of target variance explained
+relative to the mean baseline. R2 can be negative.
+
+Use sklearn.metrics: - mean_absolute_error - mean_squared_error (take
+square root for RMSE) - r2_score
+
+Guard against empty splits and constant-target edge cases. Do not hide
+warnings or invent values.
+
+Save metrics.json in a clear structure, for example: { “train”:
+{“mae_kw”: …, “rmse_kw”: …, “r2”: …}, “validation”: {“mae_kw”: …,
+“rmse_kw”: …, “r2”: …}, “test”: {“mae_kw”: …, “rmse_kw”: …, “r2”: …} }
+
+Also save: - Actual vs predicted values per split, with timestamps. -
+Optional residual summary. - Optional actual-vs-predicted plot and
+residual plot, if plotting is included. Never fabricate or prefill
+performance metrics. Metrics must come from actual execution on the
+supplied dataset.
+
+============================================================ 11.
+REQUIRED OUTPUT ARTIFACTS
+============================================================
+
+The PowerPoint explicitly names these artifacts:
+
+1.  sky_cloud_pv_regressor.joblib
+    -   Trained HistGradientBoostingRegressor model.
+2.  metrics.json
+    -   MAE, RMSE, and R2 for train, validation, and test.
+3.  matched_samples.csv
+    -   Matched image/PV samples with extracted feature vectors.
+
+Also create these practical reproducibility artifacts: 4.
+feature_schema.json - Ordered feature names, formulas, exact
+implementation choices, dtypes, bins, percentiles, gradient method,
+image resize policy.
+
+5.  run_config.json
+    -   Input paths/patterns, target column, timestamp column, duplicate
+        policies, split ratios, model hyperparameters, seed if used,
+        software versions, run time, sample limit.
+6.  predictions.csv
+    -   timestamp, split, actual_pv_kw, predicted_pv_kw,
+        absolute_error_kw, signed_error_kw.
+7.  training_summary.txt or README section
+    -   Dataset counts, skipped records, matching statistics, split
+        ranges, feature count, model configuration, metrics, warnings,
+        and limitations.
+8.  logs/
+    -   Processing and training logs.
+
+Output directory should be configurable. Do not overwrite previous runs
+without an explicit option. Use a timestamped run folder or safe
+overwrite confirmation.
+
+============================================================ 12.
+INFERENCE / PREDICTION INTERFACE
+============================================================
+
+Provide a reusable inference module or CLI.
+
+It must: - Load sky_cloud_pv_regressor.joblib. - Load
+feature_schema.json. - Accept a new image and its timestamp. - Apply the
+exact same RGB conversion, grayscale calculation, percentile list,
+gradient method, color-difference calculations, histogram bin
+edges/normalization, and feature ordering used during training. -
+Generate the same six cyclical time features. - Validate feature vector
+length, order, dtype, and finite values. - Call model.predict(). -
+Return a numeric PV power prediction in kW.
+
+Provide an example command, such as: python predict.py –image
+path/to/image.jpg –timestamp 2019-06-01T12:30:00
+
+The timestamp format can be configurable, but parsing must be validated.
+If the project only implements same-minute prediction, explain that the
+prediction is an estimate associated with the supplied image timestamp,
+not a future forecast.
+
+Do not create a web API unless explicitly requested. A simple Python
+inference CLI/module is sufficient for the core model. An optional
+FastAPI service can be added as a separate layer later.
+
+============================================================ 13.
+RECOMMENDED PROJECT STRUCTURE
+============================================================
+
+Create a clean, modular structure similar to:
+
+project/ README.md requirements.txt config/ default.yaml data/ raw/
+2019_pv_raw.csv images/ 2019_*.tar processed/ artifacts/
+sky_cloud_pv_regressor.joblib metrics.json matched_samples.csv
+feature_schema.json run_config.json predictions.csv logs/ src/ init.py
+config.py data_validation.py timestamp_utils.py archive_reader.py
+image_features.py time_features.py matching.py dataset_builder.py
+splitting.py train.py evaluate.py inference.py utils.py tests/
+test_timestamp_utils.py test_image_features.py test_time_features.py
+test_matching.py test_dataset_shapes.py train.py predict.py
+
+The exact structure can be adjusted to fit an existing repository.
+Inspect the repository first and do not destroy existing work.
+
+============================================================ 14.
+DEPENDENCIES
+============================================================
+
+Core recommended dependencies: - Python 3.10 or later (choose a version
+compatible with the environment and pin tested versions) - numpy -
+pandas - scikit-learn - joblib - Pillow - tqdm - matplotlib (only if
+generating plots) - PyYAML (if using YAML configuration) - pytest (for
+tests)
+
+Use the standard library for: - tarfile - re - datetime - pathlib -
+logging - json - argparse - hashlib (optional stable IDs/checkpoint
+integrity)
+
+The PowerPoint explicitly mentions Python, tarfile, NumPy, scikit-learn,
+Joblib, and tqdm. Pillow, pytest, matplotlib, and PyYAML are suggested
+implementation choices, not technologies confirmed by the slides.
+
+Do not install TensorFlow, PyTorch, CUDA, or GPU-specific libraries for
+the documented baseline. CNN/Transformer support is future work, not
+part of the baseline.
+
+Pin tested dependency versions in requirements.txt after checking the
+active Python environment. Avoid arbitrary version pins that are
+incompatible with the environment.
+
+============================================================ 15.
+LOGGING, ERROR HANDLING, AND REPRODUCIBILITY
+============================================================
+
+Use Python logging rather than print statements for the pipeline. Log: -
+Run ID and start/end time. - Input paths. - Archive count. - CSV rows. -
+Number of candidate image members. - Number of images decoded. -
+Timestamp parse failures. - Corrupt archives/members. - Duplicate image
+minutes and duplicate CSV minutes. - Matched and unmatched sample
+counts. - Feature extraction failures. - Final feature dimension. -
+Split counts and timestamp ranges. - Model parameters. -
+Train/validation/test metrics. - Artifact paths. - Runtime and
+throughput.
+
+Use deterministic ordering: - Sort archive paths. - Preserve a
+deterministic member traversal order. - Apply explicit duplicate
+policies. - Sort final matched samples by timestamp. - Fix random_state
+if a stochastic component is used, and document it.
+
+Do not silently swallow exceptions. Continue after recoverable
+image/archive errors, but fail with a clear message when required
+inputs, columns, or configuration are invalid.
+
+============================================================ 16. TESTING
+REQUIREMENTS
+============================================================
+
+Write automated tests for:
+
+A. Timestamp extraction: - Valid 14-digit timestamp. - Filename with no
+timestamp. - Invalid calendar date. - Filename with more than one
+14-digit sequence; ensure documented first-match behavior.
+
+B. Minute matching: - Same minute, different seconds -> match. -
+Different minute -> no match. - Duplicate images in one minute ->
+documented policy. - Duplicate CSV rows in one minute -> documented
+policy. - Unmatched image and unmatched PV row reporting.
+
+C. Image feature extraction: - RGB image. - Grayscale image. - RGBA
+image. - Palette image. - Corrupt image bytes. - Constant-color image. -
+Different image dimensions. - Verify exact feature vector length and
+stable feature names. - Verify all feature values are finite. - Verify
+histogram sums if normalized.
+
+D. Time features: - Hour 0 and hour 23 cyclic continuity. - Day-of-year
+boundaries. - Month 12 and month 1 cyclic continuity. - Exactly six time
+features. - Verify formula outputs numerically.
+
+E. Dataset: - X is 2D. - y is 1D. - X and y row counts match. - X is
+float32. - Chronological order is maintained. - No duplicate minute
+after deduplication. - No NaN/Inf in final model matrix.
+
+F. Split: - Exact 70/15/15 ratios as close as integer boundaries
+allow. - No shuffling. - Train timestamps precede validation
+timestamps. - Validation timestamps precede test timestamps. - No sample
+leakage across splits.
+
+G. Model: - Model can fit a small synthetic dataset. - Model can
+predict. - Output is finite. - Joblib save/load preserves predictions
+within numerical tolerance.
+
+H. Inference consistency: - A sample processed during training and
+reprocessed through inference has exactly the same feature order and
+values.
+
+============================================================ 17.
+IMPORTANT DATA AND MODEL QUALITY CHECKS
+============================================================
+
+-   Inspect the real dataset before full training.
+-   First run a smoke test with –max-samples (for example, a small few
+    hundred samples).
+-   Verify timestamp matching visually and statistically.
+-   Confirm the target distribution and units.
+-   Check whether target values include nighttime zeros, missing values,
+    sensor faults, or outliers.
+-   Do not remove nighttime zero values automatically; they may be
+    legitimate PV output.
+-   Check whether image timestamps and PV timestamps use the same
+    clock/time zone.
+-   Confirm the CSV sampling frequency and whether multiple measurements
+    occur per minute.
+-   Confirm whether multiple images exist per minute.
+-   Confirm whether image archive members are all actual sky-camera
+    images.
+-   Check image dimensions, modes, and corrupt image rate.
+-   Verify that feature extraction is consistent across all image types.
+-   Verify chronological split boundaries.
+-   Compare train, validation, and test metrics.
+-   If train performance is much better than validation/test,
+    investigate overfitting and temporal distribution shift.
+-   Consider a naive baseline (for example, training-set mean or
+    time-only model) as an optional diagnostic. Clearly label it as an
+    additional baseline, not as the PowerPoint’s selected model.
+-   Do not report “high accuracy” without actual measured metrics.
+-   Do not invent MAE/RMSE/R2 values.
+-   Do not claim future forecasting without a future target horizon.
+-   Do not use test data for tuning.
+
+============================================================ 18.
+LIMITATIONS AND FUTURE WORK
+============================================================
+
+Limitations documented in the PowerPoint: - No deep learning; current
+baseline relies on handcrafted features. - Handcrafted features may miss
+subtle/spatial cloud patterns. - No weather data integration. -
+Sensitive to image quality, sensor noise, occlusions, and lighting
+variation.
+
+Future improvements documented in the PowerPoint: - CNN or Vision
+Transformer image embeddings. - Weather data integration: temperature,
+humidity, wind. - Real-time prediction using live camera feeds. -
+Distributed processing/training using Apache Spark or Dask.
+
+Do not implement these as part of the baseline unless asked. Keep the
+initial implementation faithful to the HistGradientBoostingRegressor
+architecture.
+
+============================================================ 19.
+REQUIRED COMMANDS AND USER EXPERIENCE
+============================================================
+
+Provide clear commands in README:
+
+1.  Install dependencies: python -m venv .venv activate the environment
+    using OS-appropriate instructions pip install -r requirements.txt
+
+2.  Validate inputs / run smoke test: python train.py –images-dir
+    PATH_TO_IMAGES –csv PATH_TO_CSV –output-dir artifacts/smoke
+    –max-samples 300
+
+3.  Full training: python train.py –images-dir PATH_TO_IMAGES –csv
+    PATH_TO_CSV –output-dir artifacts/run_001
+
+4.  Inference: python predict.py –image PATH_TO_IMAGE –timestamp
+    YYYY-MM-DDTHH:MM:SS –model
+    artifacts/run_001/sky_cloud_pv_regressor.joblib –schema
+    artifacts/run_001/feature_schema.json
+
+Adjust exact command syntax to the implemented CLI and ensure the
+commands actually work.
+
+============================================================ 20.
+IMPLEMENTATION WORK ORDER
+============================================================
+
+Build in this order. Do not jump straight to full-scale training.
+
+PHASE 1 - REPOSITORY AND DATA INSPECTION - Inspect current repository
+and preserve existing code. - Locate CSV and TAR files. - Inspect CSV
+columns, timestamp format, row counts, missing values, duplicates,
+target distribution. - Inspect several archive names, member paths,
+timestamp examples, image formats, dimensions, modes. - Report findings
+before full training. - Do not fabricate findings if the data files are
+not present.
+
+PHASE 2 - DATA VALIDATION AND TIMESTAMP MATCHING - Implement CSV
+validation. - Implement filename regex extraction and datetime
+parsing. - Implement minute-level matching. - Implement explicit
+duplicate policies. - Test matching on a small sample.
+
+PHASE 3 - IMAGE AND TIME FEATURES - Implement deterministic feature
+extraction. - Create feature_schema.json. - Confirm feature dimension
+and feature names. - Add tests for image modes, histograms, gradients,
+percentiles, and cyclical features.
+
+PHASE 4 - STREAMING DATASET GENERATION - Process TAR archives
+sequentially. - Add tqdm and logging. - Add –max-samples. - Write
+matched_samples.csv incrementally if needed. - Confirm memory remains
+bounded.
+
+PHASE 5 - SPLITTING AND MODEL TRAINING - Sort chronologically. - Split
+70/15/15 without shuffling. - Train HistGradientBoostingRegressor with
+the specified hyperparameters. - Save model with Joblib.
+
+PHASE 6 - EVALUATION AND ARTIFACTS - Compute MAE, RMSE, R2 on
+train/validation/test. - Save metrics.json and predictions.csv. - Save
+run_config.json and feature_schema.json. - Produce plots optionally. -
+Report actual metrics only.
+
+PHASE 7 - INFERENCE AND END-TO-END TEST - Implement inference using the
+same feature code/schema. - Test on an image from the dataset. - Verify
+identical features between training and inference paths. - Document
+exact commands and limitations.
+
+PHASE 8 - FINAL REPORT Provide: - Repository structure. - Data
+inspection findings. - Final feature count and ordered schema. -
+Matching statistics. - Train/validation/test sample counts and time
+ranges. - Model parameters. - Actual metrics. - Artifact paths. -
+Runtime and memory observations if measured. - Known limitations and
+unresolved data questions.
+
+============================================================ 21. FACTS
+FROM THE POWERPOINT THAT MUST BE PRESERVED
+============================================================
+
+-   Project: Sky/Cloud Image-Based Photovoltaic (PV) Power Prediction
+    Using Machine Learning on Large-Scale Image and Time-Series Data.
+-   Inputs: timestamped sky/cloud images in TAR archives and PV output
+    CSV.
+-   Image archives: 2019_*.tar.
+-   Image formats: JPG, JPEG, PNG.
+-   Filename timestamp format: YYYYMMDDHHMMSS.
+-   Regex: ().
+-   CSV: 2019_pv_raw.csv.
+-   Timestamp column: Date.
+-   Target: Huang_E4102_kW.
+-   Target unit: kW.
+-   Matching: floor image and CSV timestamps to minute and compare.
+-   Data integrity: one sample per minute, duplicates removed.
+-   TAR processing: Python tarfile, sequential streaming, no full
+    extraction to disk.
+-   Error-safe handling: corrupted archives handled gracefully.
+-   Testing: –max-samples.
+-   Monitoring: tqdm.
+-   Image feature groups: RGB mean/std/min/max; grayscale
+    brightness/contrast/percentiles; horizontal/vertical gradient
+    magnitudes; R-B, R-G, G-B differences; 8-bin histograms for
+    R/G/B/Gray.
+-   Time features: hour sin/cos 24-hour cycle; day sin/cos 365-day
+    cycle; month sin/cos 12-month cycle.
+-   Feature vector: image features + time features, fixed-length NumPy
+    float32.
+-   Split: chronological 70% train, 15% validation, 15% test; no
+    shuffle.
+-   Model: sklearn.ensemble.HistGradientBoostingRegressor.
+-   Hyperparameters: learning_rate=0.05, max_depth=6, max_iter=300,
+    min_samples_leaf=20.
+-   Evaluation: MAE, RMSE, R2 on train/validation/test.
+-   Output model: sky_cloud_pv_regressor.joblib.
+-   Metrics output: metrics.json.
+-   Dataset output: matched_samples.csv.
+-   Scalability: streaming and incremental feature extraction.
+-   Future distributed processing: Spark/Dask.
+-   Limitations: no deep learning, handcrafted features, no weather
+    integration, image quality sensitivity.
+-   Future directions: CNN/ViT embeddings, weather integration,
+    real-time prediction, distributed processing.
+
+============================================================ 22. FINAL
+INSTRUCTIONS TO THE CODING AGENT
+============================================================
+
+Act as a senior ML engineer. Build a complete, working, tested,
+reproducible implementation, not just pseudocode or a high-level
+explanation.
+
+First inspect the existing repository and actual data. Then implement
+the pipeline in modular files. Preserve the documented architecture and
+exact baseline model configuration.
+
+Do not: - invent input files or pretend the dataset is present; -
+fabricate performance metrics; - assume unspecified image-processing
+parameters are facts from the slides; - silently choose duplicate
+records; - load all TAR images into memory; - randomly shuffle the
+time-series samples; - use a CNN as the baseline; - claim future
+forecasting without a shifted target; - train on the test set or tune
+using test metrics; - change the target column or target units; - omit
+the feature schema or inference consistency checks.
+
+If the dataset is unavailable, finish the code and tests using synthetic
+fixtures, clearly mark that real training has not been run, and provide
+the exact command needed when the data becomes available.
+
+Before full training, show a concise data-inspection report and run a
+small smoke test. Only launch full-scale processing after confirming the
+input layout and successful smoke test, unless the user explicitly
+instructs otherwise.
+
+The final deliverable must include source code, tests, requirements,
+README, trained artifacts if real data is available, actual evaluation
+metrics if training completed, and a clear explanation of all
+implementation decisions that were not specified in the PowerPoint.
+Displaying sky_cloud_pv_ml_build_spec.txt.
